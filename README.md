@@ -124,6 +124,18 @@ res = dllm.generate(input_ids, gen_length=1024, block_length=64)
 print(tokenizer.decode(res[0, input_ids.shape[1]:], skip_special_tokens=False))
 ```
 
+### Evaluate Dinfer performance on different benchmarks 
+We provide an integration with lm‑eval‑harness, which allows you to evaluate dInfer‑based models on a variety of standard benchmarks.
+To simplify usage, we also include a ready‑to‑run bash script that contains all the necessary environment variables and evaluation parameters.
+You only need to modify the configuration values in the script (e.g., model_path, parallel_decoding, threshold, tp_size, etc.),
+and then execute it to launch the full evaluation process.
+
+```python
+cd evaluations
+bash eval_gsm8k.sh
+```
+
+
 ## Cite
 
 ```
