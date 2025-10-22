@@ -18,7 +18,6 @@ warmup_times=4 # warmup times for cache
 cont_weight=0.3 # cont weight 
 use_credit=False # use credit for threshold mechanism
 use_compile=True # use compile
-tp_size=4 # tensor parallel size
 gpus='0,1,2,3' # gpus for tensor parallel inference
 parallel='tp' # 'tp' for tensor parallel or 'dp' for data parallel
 output_path='your customer output path'
@@ -29,14 +28,14 @@ parallel_decoding='threshold' # or hierarchy
 threshold=0.8 # threshold for parallel decoding
 python eval_dinfer.py --tasks ${task} \
   --confirm_run_unsafe_code --model dInfer_eval \
-  --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},prefix_look=${prefix_look},after_look=${after_look},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},tp_size=${tp_size},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit} \
+  --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},prefix_look=${prefix_look},after_look=${after_look},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit} \
   --output_path ${output_path} --include_path ./tasks --apply_chat_template 
 
 # # use accelerate to enable multi-gpu data parallel inference
 # parallel=dp
 # accelerate launch eval_dinfer.py --tasks ${task} \
 # --confirm_run_unsafe_code --model dInfer_eval \
-# --model_args model_path=${model_path},gen_length=${length}block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},prefix_look=${prefix_look},after_look=${after_look},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},tp_size=${tp_size},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit},gpus=${gpus} \
+# --model_args model_path=${model_path},gen_length=${length}block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},prefix_look=${prefix_look},after_look=${after_look},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit},gpus=${gpus} \
 # --output_path ${output_path} --include_path ../tasks --apply_chat_template
 
 # use hierarchy mechanism for parallel decoding 
@@ -45,5 +44,5 @@ threshold=0.92 # threshold for parallel decoding
 low_threshold=0.62 # low threshold for parallel decoding when using hierarchy mechanism
 python eval_dinfer.py --tasks ${task} \
 --confirm_run_unsafe_code --model dInfer_eval \
---model_args model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},prefix_look=${prefix_look},after_look=${after_look},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},tp_size=${tp_size},parallel=${parallel} \
+--model_args model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},prefix_look=${prefix_look},after_look=${after_look},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},parallel=${parallel} \
 --output_path ${output_path} --include_path ../tasks --apply_chat_template --log_samples
