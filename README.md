@@ -222,21 +222,6 @@ python eval_dinfer.py \
 
 If you prefer **data‑parallel** evaluation (each GPU handles separate requests):
 
-1️⃣ Configure accelerate first:
-
-```bash
-accelerate config
-```
-
-Select:
-```
-Compute environment: LOCAL_MACHINE
-Distributed mode: MULTI_GPU
-Mixed precision: bf16 or no
-```
-
-2️⃣ Launch evaluation:
-
 ```bash
 parallel='dp'
 
