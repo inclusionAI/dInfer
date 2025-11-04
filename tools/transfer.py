@@ -12,7 +12,7 @@ except NameError:
 
 sys.path.append(current_dir)
 
-from .modeling_fused_lladamoe import FusedLLaDAMoEModelLM
+from modeling_fused_lladamoe import FusedLLaDAMoEModelLM
 from transformers import AutoTokenizer, AutoModel
 
 def convert_and_save(
