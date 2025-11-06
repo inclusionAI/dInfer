@@ -17,7 +17,7 @@ def get_transfer_index_hierarchy_fast_v2(logits, temperature, remasking, mask_in
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
 
     if remasking == 'low_confidence':
-        p = F.softmax(logits, dim=-1)
+        p = F.softmax(logits.to(torch.float32), dim=-1)
         x0_p = torch.squeeze(
             torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
     else:
