@@ -16,7 +16,7 @@
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
 from .configuration_llada import LLaDAConfig
-from .modeling_llada_origin import LLaDAModelLM
+from .modeling_llada import LLaDAModelLM
 from .modeling_fused_olmoe import FusedOlmoeForCausalLM
 from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
 from .modeling_llada2_moe import LLaDA2MoeModelLM

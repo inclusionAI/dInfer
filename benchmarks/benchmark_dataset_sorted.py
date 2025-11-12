@@ -128,6 +128,7 @@ def main(world_size, rank, gpu_id, args):
             eos_id = 126081
         else:
             raise ValueError('model type not supported')
+        
         if args.tp_size>1 and args.use_tp:
             print('enabling tp')
             model.tensor_parallel(args.tp_size)

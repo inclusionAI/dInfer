@@ -5,7 +5,7 @@ import numpy as np
 import torch.nn.functional as F
 import os
 from transformers import AutoTokenizer, AutoModel
-from model.modeling_llada_origin import LLaDAModelLM
+from model.modeling_llada import LLaDAModelLM
 import time
 
 from .parellel_strategy import get_transfer_index_cache

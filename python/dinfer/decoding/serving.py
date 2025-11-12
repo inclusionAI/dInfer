@@ -13,7 +13,7 @@ from .parallel_strategy import ThresholdParallelDecoder, CreditThresholdParallel
 from .utils import KVCacheFactory, BlockIteratorFactory
 from .generate_uniform import IterSmoothWithVicinityCacheDiffusionLLM, IterSmoothDiffusionLLM, VicinityCacheDiffusionLLM, BlockWiseDiffusionLLM, BlockDiffusionLLM
 from ..model.modeling_fused_olmoe import FusedOlmoeForCausalLM
-from ..model.modeling_llada_origin import LLaDAModelLM
+from ..model.modeling_llada import LLaDAModelLM
 
 logger = logging.getLogger(__name__)
 

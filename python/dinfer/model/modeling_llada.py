@@ -28,6 +28,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Literal,
     NamedTuple,
     Optional,
     Sequence,
@@ -51,7 +52,10 @@ from torch import einsum, values_copy
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.auto import AutoModel
-# from .flash_attn_triton import FlashAttnFunc
+from transformers.cache_utils import Cache
+
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
 
 from .configuration_llada import (
     LLaDAConfig,
@@ -72,6 +76,12 @@ elif sys.version_info.minor == 8:
 else:
     raise SystemExit("This script supports Python 3.8 or higher")
 
+import re
+
+from .tp_linear import (ColumnParallelLinear,
+                        ReplicatedLinear,
+                        RowParallelLinear)
+
 __all__ = [
     "LayerNormBase",
     "LayerNorm",
@@ -88,6 +98,45 @@ __all__ = [
     "LLaDAOutput",
     "LLaDAGenerateOutput",
 ]
+
+def replace_linear_class(
+    linear: nn.Linear, style: Literal["colwise", "rowwise"],
+    rank:int=0, world_size:int=1
+) -> Union[ColumnParallelLinear, RowParallelLinear]:
+    """
+    Replace nn.Linear with one of vLLM's tensor parallel linear classes.
+
+    Args:
+        linear (nn.Linear): `nn.Linear` to be replaced.
+        style (str): Tensor parallel style of the new linear, e.g. "colwise".
+        quant_config (QuantConfig): Quantization config for the new linear.
+    Returns:
+        Union[ColumnParallelLinear, RowParallelLinear]: The new linear.
+    """
+
+    if not isinstance(style, str):
+        raise ValueError(
+            f"Unsupported parallel style type {type(style)}, expected str")
+
+    vllm_linear_cls = {
+        "colwise": ColumnParallelLinear,
+        "rowwise": RowParallelLinear,
+    }.get(style, ReplicatedLinear)
+
+    rank = get_tensor_model_parallel_rank()
+    world_size = get_tensor_model_parallel_world_size()
+
+    new_module = vllm_linear_cls(
+        input_size=linear.in_features,
+        output_size=linear.out_features,
+        bias=linear.bias is not None,
+        tp_rank=rank,
+        tp_size=world_size,
+        return_bias=False,
+    )
+
+    new_module = new_module.to(dtype=linear.weight.dtype, device=linear.weight.device)
+    return new_module
 
 
 log = logging.getLogger(__name__)
@@ -391,10 +440,11 @@ class RotaryEmbedding(nn.Module):
     [Rotary positional embeddings (RoPE)](https://arxiv.org/abs/2104.09864).
     """
 
-    def __init__(self, config: ModelConfig, cache: BufferCache):
+    def __init__(self, config: ModelConfig, cache: BufferCache, tp_size: int = 1):
         super().__init__()
         self.config = config
         self.__cache = cache
+        self.tp_size = tp_size
         # Warm up cache.
         self.rope_theta = config.rope_theta
         self.get_rotary_embedding(config.max_sequence_length, _non_meta_init_device(config))
@@ -415,12 +465,13 @@ class RotaryEmbedding(nn.Module):
             return pos_sin[:, :, :seq_len, :].clone(), pos_cos[:, :, :seq_len, :].clone()
 
         with torch.autocast(device.type, enabled=False):
-            dim = self.config.d_model // self.config.n_heads
+            dim = self.config.d_model // self.config.n_heads // self.tp_size
             inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim))
             seq = torch.arange(seq_len, device=device, dtype=torch.float)
             freqs = einsum("i , j -> i j", seq, inv_freq)
             positions = torch.cat((freqs, freqs), dim=-1)
-            pos_sin, pos_cos = positions.sin()[None, None, :, :], positions.cos()[None, None, :, :]
+            pos_sin = positions.sin()[None, None, :, :].clone()
+            pos_cos = positions.cos()[None, None, :, :].clone()
         self.__cache["rope_pos_sin"] = pos_sin.clone()
         self.__cache["rope_pos_cos"] = pos_cos.clone()
         return pos_sin, pos_cos
@@ -567,6 +618,10 @@ class LLaDABlock(nn.Module):
         assert config.d_model % config.n_heads == 0
 
         self._activation_checkpoint_fn = None
+        try:
+            self.tp_size = get_tensor_model_parallel_world_size()
+        except AssertionError:
+            self.tp_size = 1
 
         # Dropout.
         self.dropout = Dropout(config.residual_dropout)
@@ -602,7 +657,7 @@ class LLaDABlock(nn.Module):
 
         # Rotary embeddings.
         if self.config.rope:
-            self.rotary_emb = RotaryEmbedding(config, self.__cache)
+            self.rotary_emb = RotaryEmbedding(config, self.__cache, tp_size=self.tp_size)
 
         self.flash_attn_func = None
         if config.flash_attention:
@@ -693,206 +748,6 @@ class LLaDABlock(nn.Module):
             )
 
 
-    def attention_overlap(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        attention_bias: Optional[torch.Tensor] = None,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_cache: bool = False,
-        replace_position: Optional[torch.Tensor] = None,
-        use_ring_attn: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        x_normed = self.attn_norm(x) #x:torch.Size([2, 168, 4096])
-        if layer_past is None:
-            layer_past= torch.empty(0)
-            has_layer_past = False
-        else:
-            has_layer_past = True
-            
-            
-        assert self.q_norm is None and self.k_norm is None
-        use_all_to_all = True
-        fuse_comm = True
-        if use_ring_attn:
-            if fuse_comm:
-                v = self.v_proj(x_normed) #v:torch.Size([2, 168, 4096])
-                B, T, C = v.size()  # batch size, sequence length, d_model
-                # print("use ring")
-                world_size = dist.get_world_size()
-
-                k = self.k_proj(x_normed) #k:torch.Size([2, 168, 4096])
-
-                k = k.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads)
-                v = v.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads)        
-                kv = torch.stack([k, v], dim=0).contiguous()
-
-                # gathered_kv = [torch.empty_like(kv) for _ in range(world_size)]
-                # dist.all_gather(gathered_kv, kv)                   
-                # k, v = torch.cat(gathered_kv, dim=2).permute(0,1, 3, 2, 4).split(1, 0)
-                kv = kv.unsqueeze(0).repeat(world_size, 1, 1, 1, 1, 1).contiguous()            
-                gathered_kv = torch.empty((world_size, 2, B, T, self.config.effective_n_kv_heads, C // self.config.n_heads), device=v.device, dtype=v.dtype)
-                dist.all_to_all_single(gathered_kv, kv)            
-                k, v = gathered_kv.permute(1,2,4,0,3,5).flatten(3, 4).split(1, 0)
-                
-                k = k.squeeze(0)
-                v = v.squeeze(0)
-                                
-                q = self.q_proj(x_normed) #q:torch.Size([2, 168, 4096])       
-                q = q.view(B, T, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
-
-            elif use_all_to_all:
-                v = self.v_proj(x_normed) #v:torch.Size([2, 168, 4096])
-                B, T, C = v.size()  # batch size, sequence length, d_model
-                dtype = v.dtype            
-                # print("use ring")
-                v = v.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads)        
-                world_size = dist.get_world_size()
-                v = v.unsqueeze(0).repeat(world_size, 1, 1, 1, 1).contiguous()
-                
-                gathered_v = torch.empty((world_size, B, T, self.config.effective_n_kv_heads, C // self.config.n_heads), device=v.device, dtype=v.dtype)
-                # gathered_v = [torch.empty_like(v) for _ in range(world_size)]
-                comm_v = dist.all_to_all_single(gathered_v, v, async_op=False)            
-                k = self.k_proj(x_normed) #k:torch.Size([2, 168, 4096])
-                k = k.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads)
-                k = k.unsqueeze(0).repeat(world_size, 1, 1, 1, 1).contiguous()
-                gathered_k = torch.empty((world_size, B, T, self.config.effective_n_kv_heads, C // self.config.n_heads), device=k.device, dtype=k.dtype)
-                # gathered_k = [torch.empty_like(k) for _ in range(world_size)]
-                comm_k = dist.all_to_all_single(gathered_k, k, async_op=False)
-                q = self.q_proj(x_normed) #q:torch.Size([2, 168, 4096])       
-                q = q.view(B, T, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
-
-                # comm_v.wait()
-                v = gathered_v.permute(1,3,0,2,4).flatten(2, 3)
-                # gathered_v = torch.cat(gathered_v, dim=1)            
-                # comm_k.wait()
-                k = gathered_k.permute(1,3,0,2,4).flatten(2, 3)
-            else:
-                v = self.v_proj(x_normed) #v:torch.Size([2, 168, 4096])
-                B, T, C = v.size()  # batch size, sequence length, d_model
-                dtype = v.dtype       
-                world_size = dist.get_world_size()
-
-
-                v = v.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2).contiguous()
-                
-                # gathered_v = torch.empty((world_size, B, T, self.config.effective_n_kv_heads, C // self.config.n_heads), device=v.device, dtype=v.dtype)
-                gathered_v = [torch.empty_like(v) for _ in range(world_size)]
-                comm_v = dist.all_gather(gathered_v, v, async_op=False)   
-                # comm_v = dist.all_gather_into_tensor(gathered_v, v, async_op=True)   
-
-                k = self.k_proj(x_normed) #k:torch.Size([2, 168, 4096])
-                k = k.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2).contiguous()       
-                # gathered_k = torch.empty((world_size, B, T, self.config.effective_n_kv_heads, C // self.config.n_heads), device=k.device, dtype=k.dtype)
-                gathered_k = [torch.empty_like(k) for _ in range(world_size)]
-                comm_k = dist.all_gather(gathered_k, k, async_op=False)                
-                # comm_k = dist.all_gather_into_tensor(gathered_k, k, async_op=True)                
-                q = self.q_proj(x_normed) #q:torch.Size([2, 168, 4096])       
-                q = q.view(B, T, self.config.n_heads, C // self.config.n_heads).transpose(1, 2).contiguous()
-                
-                # comm_v.wait()
-                v = torch.cat(gathered_v, dim=2)
-
-                # comm_k.wait()
-                k = torch.cat(gathered_k, dim=2)
-        else:
-            q_ = self.q_proj(x_normed) #q:torch.Size([2, 168, 4096])       
-            B, T, C = q_.size()  # batch size, sequence length, d_model                      
-            q = q_.view(B, T, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
-            k = self.k_proj(x_normed).view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
-            v = self.v_proj(x_normed).view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
-  
-     
-        # print(q.shape, k.shape, v.shape)
-
-        prev_length = 0
-        if has_layer_past: 
-            # if len(layer_past)>2:
-            #     print(len(layer_past))
-            #     for data in layer_past:
-            #         print(data.shape)
-            past_key, past_value = layer_past
-            if replace_position is None:
-                new_k = torch.empty(k.shape[0], k.shape[1], past_key.shape[2]+k.shape[2], k.shape[3], device=k.device, dtype=k.dtype)
-                new_v = torch.empty(v.shape[0], v.shape[1], past_value.shape[2]+v.shape[2], v.shape[3], device=v.device, dtype=v.dtype)
-                prev_length = past_key.shape[-2]
-                new_k[:, :, :prev_length] = past_key
-                new_v[:, :, :prev_length] = past_value
-                new_k[:, :, prev_length:] = k
-                new_v[:, :, prev_length:] = v
-                k = new_k
-                v = new_v
-                # prev_length = past_key.shape[-2]
-                # k = torch.cat((past_key, k), dim=-2)
-                # v = torch.cat((past_value, v), dim=-2)
-            else:
-                # k shape is [B, n_kv_h, selected_length, hs]
-                # replace_position shape is [B, L], where L contains 0s and 1s, 0 means no replacement, 1 means replace, with selected_length number of 1s
-                # past_key shape is [B, n_kv_h, L, hs]
-                # Replace selected_length number of 1s in past_key with k
-                # Get the indices that need to be replaced
-                replace_indices = replace_position.nonzero(as_tuple=True)[1]  # [selected_length]
-                # Use scatter operation to perform replacement
-                past_key[:, :, replace_indices] = k
-                k = past_key
-                # Perform the same operation for value
-                past_value[:, :, replace_indices] = v
-                v = past_value
-
-
-
-        present = (k.clone(), v.clone()) if use_cache else None #present: None
-        query_len, key_len = q.shape[-2], k.shape[-2]  # could be different if layer_past not None
-
-        if self.config.rope:
-            # Apply rotary embeddings.
-            if dist.is_initialized and dist.get_world_size() > 1:
-                start_pos = prev_length + dist.get_rank() * q.shape[2]
-                end_pos = prev_length + (dist.get_rank()+1) * q.shape[2]
-                # print(dist.get_rank(), prev_length, q.shape, k.shape, end_pos)
-                assert replace_position is None
-                if replace_position is None:
-                    q, k = self.rotary_emb(q, k, end_pos)
-                else:
-                    q, k = self.rotary_emb(q, k, replace_indices.max()+1)
-            else:
-                if replace_position is None:
-                    q, k = self.rotary_emb(q, k)
-                else:
-                    q, k = self.rotary_emb(q, k, replace_indices.max()+1)
-
-        assert attention_bias is None
-
-        if self.flash_attn_func is not None:
-            # print(self.flash_attn_func)
-            r = self.flash_attn_func(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), \
-                    dropout_p=0.0 if not self.training else self.config.attention_dropout, causal=False
-            )
-            return r.transpose(1, 2)
-        # used for SP support, not available now
-        # elif use_ring_attn:
-
-        #     # gathered_k = torch.cat(gathered_k, dim=1)
-        #     # print(gathered_k.shape)
-        #     # print(q.shape, gathered_k.shape, gathered_v.shape)
-        #     att = FlashAttnFunc.apply(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-        #     att = att.contiguous().view(B, T, C)
-        else:
-            att = self._scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=0.0 if not self.training else self.config.attention_dropout,
-                is_causal=False,
-            )
-            # Re-assemble all head outputs side-by-side.
-            att = att.transpose(1, 2).contiguous().view(B, T, C)
-
-        # Apply output projection.
-        return self.attn_out(att), present
-
     def attention(
         self,
         q: torch.Tensor,
@@ -901,13 +756,14 @@ class LLaDABlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache: Optional[Cache] = None,
         use_cache: bool = False,
         replace_position: Optional[torch.Tensor] = None,
-        use_ring_attn: bool = True,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
 
+        tp_size = getattr(self, "tp_size", 1)
         # Optionally apply layer norm to keys and queries.
         if self.q_norm is not None and self.k_norm is not None: #self.q_norm: None, self.k_norm: None
             q = self.q_norm(q).to(dtype=dtype)
@@ -916,13 +772,18 @@ class LLaDABlock(nn.Module):
         # Move head forward to be next to the batch dim.
         # shape: (B, nh, T, hs)
         # self.config.n_heads: 32
-        q = q.view(B, T, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
+        actual_nheads = self.config.n_heads//tp_size
+        actual_kv_heads = self.config.effective_n_kv_heads//tp_size        
+        q = q.view(B, T, actual_nheads, C // actual_nheads).transpose(1, 2)
         # shape: (B, n_kv_h, T, hs)
-        k = k.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
+        k = k.view(B, T, actual_kv_heads, C // actual_nheads).transpose(1, 2)
         # shape: (B, n_kv_h, T, hs)
-        v = v.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
+        v = v.view(B, T, actual_kv_heads, C // actual_nheads).transpose(1, 2)
 
-        if layer_past is not None: 
+        # if layer_past is not None: 
+        if kv_cache is not None:
+            k, v = kv_cache.update(k, v, self.layer_id, replace_position)
+        elif layer_past is not None:
             past_key, past_value = layer_past
             if replace_position is None:
                 k = torch.cat((past_key, k), dim=-2)
@@ -933,15 +794,10 @@ class LLaDABlock(nn.Module):
                 # past_key shape is [B, n_kv_h, L, hs]
                 # Replace selected_length number of 1s in past_key with k
                 # Get the indices that need to be replaced
-                replace_indices = replace_position.nonzero(as_tuple=True)[1]  # [selected_length]
-                # Use scatter operation to perform replacement
-                past_key[:, :, replace_indices] = k
-                k = past_key
-                # Perform the same operation for value
-                past_value[:, :, replace_indices] = v
-                v = past_value
-
-        present = (k, v) if use_cache else None #present: None
+                start, end = replace_position
+                k = past_key.slice_scatter(k, dim=2, start=start, end=end)
+                v = past_value.slice_scatter(v, dim=2, start=start, end=end)
+        present = (k, v) if use_cache else None # present: None
         query_len, key_len = q.shape[-2], k.shape[-2]  # could be different if layer_past not None
 
         if self.config.rope:
@@ -949,7 +805,7 @@ class LLaDABlock(nn.Module):
             if replace_position is None:
                 q, k = self.rotary_emb(q, k)
             else:
-                q, k = self.rotary_emb(q, k, replace_indices.max()+1)
+                q, k = self.rotary_emb(q, k, replace_position[1])
 
         if attention_bias is not None:
             # Resize and cast attention bias.
@@ -984,6 +840,7 @@ class LLaDABlock(nn.Module):
         x: torch.Tensor,
         attention_bias: Optional[torch.FloatTensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         raise NotImplementedError
@@ -1041,6 +898,7 @@ class LLaDASequentialBlock(LLaDABlock):
         x: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache: Optional[Cache] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
@@ -1060,10 +918,10 @@ class LLaDASequentialBlock(LLaDABlock):
         # Get attention scores.
         if self._activation_checkpoint_fn is not None:
             att, cache = self._activation_checkpoint_fn(  # type: ignore
-                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache
+                self.attention, q, k, v, attention_bias, layer_past=layer_past, kv_cache=kv_cache, use_cache=use_cache
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache)
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, kv_cache=kv_cache, use_cache=use_cache)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -1143,9 +1001,9 @@ class LLaDALlamaBlock(LLaDABlock):
         x: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache: Optional[Cache] = None,
         use_cache: bool = False,
         replace_position: Optional[torch.Tensor] = None,
-        use_ring_attn: bool = True,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -1154,7 +1012,6 @@ class LLaDALlamaBlock(LLaDABlock):
         #                      k, v: (batch_size, seq_len, d_model // n_heads)
         #  - for group query attn q: (batch_size, seq_len, d_model)
         #                      k, v: (batch_size, seq_len, d_model // n_kv_heads)
-        use_ring_attn = use_ring_attn and dist.is_initialized() and dist.get_world_size() > 1
         
         # print('llama_block')
 
@@ -1168,18 +1025,14 @@ class LLaDALlamaBlock(LLaDABlock):
             v = self.v_proj(x_normed) #v:torch.Size([2, 168, 4096])
             q = self.q_proj(x_normed) #q:torch.Size([2, 168, 4096])            
             att, cache = self._activation_checkpoint_fn(  # type: ignore
-                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position
+                self.attention, q, k, v, attention_bias, layer_past=layer_past, kv_cache=kv_cache, use_cache=use_cache, replace_position=replace_position
             )
         else:
-            # print(use_ring_attn)
-            if use_ring_attn:
-                att, cache = self.attention_overlap(x, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position, use_ring_attn=use_ring_attn)
-            else:
-                x_normed = self.attn_norm(x) #x:torch.Size([2, 168, 4096])
-                k = self.k_proj(x_normed) #k:torch.Size([2, 168, 4096])
-                v = self.v_proj(x_normed) #v:torch.Size([2, 168, 4096])
-                q = self.q_proj(x_normed) #q:torch.Size([2, 168, 4096])                  
-                att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position)
+            x_normed = self.attn_norm(x) #x:torch.Size([2, 168, 4096])
+            k = self.k_proj(x_normed) #k:torch.Size([2, 168, 4096])
+            v = self.v_proj(x_normed) #v:torch.Size([2, 168, 4096])
+            q = self.q_proj(x_normed) #q:torch.Size([2, 168, 4096])                  
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, kv_cache=kv_cache, use_cache=use_cache,replace_position=replace_position)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -1362,6 +1215,7 @@ class LLaDABlockGroup(nn.ModuleList):
         x: torch.Tensor,
         attention_bias: Optional[torch.FloatTensor] = None,
         layers_past: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        kv_cache: Optional[Cache] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
@@ -1385,11 +1239,11 @@ class LLaDABlockGroup(nn.ModuleList):
             ):
                 # shape: (batch_size, seq_len, d_model)
                 x, cache = self._activation_checkpoint_fn(  # type: ignore
-                    block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
+                    block, x, attention_bias=attention_bias, layer_past=layer_past, kv_cache=kv_cache, use_cache=use_cache
                 )
             else:
                 # shape: (batch_size, seq_len, d_model)
-                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
+                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, kv_cache=kv_cache, use_cache=use_cache)
             if attn_key_values is not None:
                 assert cache is not None
                 attn_key_values.append(cache)
@@ -1549,6 +1403,7 @@ class LLaDAModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
         past_key_values: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        kv_cache: Optional[Cache] = None,
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
@@ -1591,14 +1446,34 @@ class LLaDAModel(nn.Module):
 
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
 
-        if past_key_values:
-            assert len(past_key_values) == self.config.n_layers
+        def _is_cache_object(obj) -> bool:
+            if obj is None:
+                return False
+            if isinstance(obj, (list, tuple)):
+                return False
+            
+            required_attrs = ['num_layers', 'seq_len', 'get_keys', 'get_values']
+            has_cache_interface = all(hasattr(obj, attr) for attr in required_attrs)
+            if not has_cache_interface:
+                raise TypeError(f"past_key_values must be list, tuple, or Cache object with "f"attributes {required_attrs}. Got {type(obj).__name__}")
+            return True
+                                
+        is_cache_object = _is_cache_object(past_key_values)
+
+        if (past_key_values is not None) and (kv_cache is None):
+            if is_cache_object:
+                assert past_key_values.num_layers == self.config.n_layers
+            else:
+                assert len(past_key_values) == self.config.n_layers
 
         batch_size, seq_len = input_ids.size() if input_embeddings is None else input_embeddings.size()[:2]
         if past_key_values is None:
             past_length = 0
         else:
-            past_length = past_key_values[0][0].size(-2)
+            if is_cache_object:
+                past_length = past_key_values.seq_len
+            else:
+                past_length = past_key_values[0][0].size(-2)
 
         # Get embeddings of input.
         # shape: (batch_size, seq_len, d_model)
@@ -1675,7 +1550,12 @@ class LLaDAModel(nn.Module):
                     # add hidden states
                     all_hidden_states.append(x)
 
-                layer_past = None if past_key_values is None else past_key_values[block_idx]
+                if past_key_values is None or kv_cache is not None:
+                    layer_past = None
+                elif is_cache_object:
+                    layer_past = (past_key_values.get_keys(block_idx), past_key_values.get_values(block_idx))
+                else:
+                    layer_past = past_key_values[block_idx]
                 if (
                     (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
                     or (
@@ -1693,11 +1573,11 @@ class LLaDAModel(nn.Module):
                 ):
                     # shape: (batch_size, seq_len, d_model)
                     x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position
+                        block, x, attention_bias=attention_bias, layer_past=layer_past, kv_cache=kv_cache, use_cache=use_cache,replace_position=replace_position
                     )
                 else:
                     # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position)
+                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, kv_cache=kv_cache, use_cache=use_cache,replace_position=replace_position)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
@@ -1707,15 +1587,18 @@ class LLaDAModel(nn.Module):
                     # add hidden states
                     all_hidden_states.append(x)
 
-                layers_past = (
-                    None
-                    if past_key_values is None
-                    else past_key_values[
+                if past_key_values is None or kv_cache is not None:
+                    layer_past = None
+                elif is_cache_object:
+                    layer_past = []
+                    for layer_idx in range(group_idx * self.config.block_group_size, (group_idx + 1) * self.config.block_group_size):
+                        layer_past.append((past_key_values.get_keys(layer_idx), past_key_values.get_values(layer_idx)))
+                else:
+                    layer_past = past_key_values[
                         group_idx * self.config.block_group_size : (group_idx + 1) * self.config.block_group_size
                     ]
-                )
                 x, cache = block_group(
-                    x, attention_bias=attention_bias, layers_past=layers_past, use_cache=use_cache
+                    x, attention_bias=attention_bias, layers_past=layer_past, kv_cache=kv_cache, use_cache=use_cache
                 )
                 if attn_key_values is not None:
                     assert cache is not None
@@ -1775,6 +1658,15 @@ class LLaDAModelLM(PreTrainedModel):
             self.model = LLaDAModel(model_config, init_params=init_params)
         else:
             self.model = model
+        self._tp_plan = {
+            "transformer.blocks.*.q_proj": "colwise",
+            "transformer.blocks.*.k_proj": "colwise",
+            "transformer.blocks.*.v_proj": "colwise",
+            "transformer.blocks.*.attn_out": "rowwise",
+            "transformer.blocks.*.ff_proj": "colwise",
+            "transformer.blocks.*.up_proj": "colwise",
+            "transformer.blocks.*.ff_out": "rowwise",
+        }
 
     def forward(
         self,
@@ -1783,6 +1675,7 @@ class LLaDAModelLM(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
+        kv_cache: Optional[Cache] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -1804,6 +1697,7 @@ class LLaDAModelLM(PreTrainedModel):
             attention_mask=attention_mask,
             attention_bias=attention_bias,
             past_key_values=past_key_values,
+            kv_cache=kv_cache,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             replace_position=replace_position,
@@ -1819,9 +1713,16 @@ class LLaDAModelLM(PreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
+        flattened_past_key_values = None
+        if outputs.attn_key_values is not None:
+            flattened_past_key_values = []
+            for k, v in outputs.attn_key_values:
+                flattened_past_key_values.append(k)
+                flattened_past_key_values.append(v)
+
         return CausalLMOutputWithPast(
             logits=logits,
-            past_key_values=outputs.attn_key_values,
+            past_key_values=flattened_past_key_values,
             hidden_states=hidden_states,
         )
 
@@ -1862,6 +1763,33 @@ class LLaDAModelLM(PreTrainedModel):
     def tie_weights(self):
         if self.config.weight_tying:
             self.model.transformer.ff_out = self.model.transformer.wte
+            
+
+    def tensor_parallel(self, tp_size):
+        """
+        Apply the model's tensor parallelization plan.
+        Currently only supports linear layers.
+        """
+        tp_plan = self._tp_plan
+
+        def _tensor_parallel(module: nn.Module, prefix: str = ""):
+            for child_name, child_module in module.named_children():
+                qual_name = child_name if prefix == "" else f"{prefix}.{child_name}"
+                for pattern, style in tp_plan.items():
+                    if re.match(pattern, qual_name) and isinstance(
+                            child_module, nn.Linear):
+                        new_module = replace_linear_class(
+                            child_module, style)
+                        new_module.weight_loader(new_module.weight, child_module.weight)
+                        setattr(module, child_name, new_module)
+                        break
+                else:
+                    _tensor_parallel(child_module, prefix=qual_name)
+                if '.blocks.' in qual_name and len(qual_name.split('.'))==3:
+                    child_module.tp_size = tp_size
+
+                    
+        _tensor_parallel(self.model)
 
 # Register the model so that it is available for transformer pipelines, auto-loading, etc.
 AutoModel.register(LLaDAConfig, LLaDAModelLM)
