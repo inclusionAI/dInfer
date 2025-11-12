@@ -51,7 +51,9 @@ gpus='0,1,2,3'
 parallel='tp'            # 'tp' for tensor parallel, 'dp' for accelerate DP
 
 # Evaluation task
-task=mbpp_sanitized_llada # or gsm8k_llada
+# for llada 1.5 use tasks gsm8k_llada1.5 mbpp_sanitized_llada1.5
+# for llada moe use tasks gsm8k_llada_moe mbpp_sanitized_llada_moe
+task=mbpp_sanitized_llada_moe # or gsm8k_llada_moe
 ```
 ### ⚙️ Run with Tensor Parallel (TP)
 
@@ -138,6 +140,38 @@ Enable hierarchical decoding for improved quality:
 parallel_decoding='hierarchy'
 threshold=0.92
 low_threshold=0.62
+
+python eval_dinfer.py \
+  --tasks ${task} \
+  --confirm_run_unsafe_code \
+  --model dInfer_eval \
+  --model_args \
+  model_path=${model_path},\
+  gen_length=${length},\
+  block_length=${block_length},\
+  threshold=${threshold},\
+  low_threshold=${low_threshold},\
+  save_dir=${output_path},\
+  parallel_decoding=${parallel_decoding},\
+  prefix_look=${prefix_look},\
+  after_look=${after_look},\
+  cache=${cache},\
+  warmup_times=${warmup_times},\
+  cont_weight=${cont_weight} \
+  --output_path ${output_path} \
+  --include_path ./tasks \
+  --apply_chat_template \
+  --log_samples
+```
+
+---
+
+### 💿 Use Credit for Threshold Parallel Decoding
+
+```bash
+parallel_decoding='threshold'
+threshold=0.8
+use_credit=True
 
 python eval_dinfer.py \
   --tasks ${task} \
