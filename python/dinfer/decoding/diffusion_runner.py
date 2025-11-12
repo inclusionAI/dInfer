@@ -384,6 +384,7 @@ class CudaGraphRunner:
         self.input_ids[:raw_num_token].copy_(input_ids.flatten())
         self.position_ids[:raw_num_token].copy_(position_ids.flatten())
         minimal_length = min(self.past_key_values.shape[4], past_key_values.shape[4])
+        self.past_key_values[:, :, :bs, :, minimal_length:].fill_(0)
         self.past_key_values[:, :, :bs, :, :minimal_length].copy_(past_key_values[:, :, :, :, :minimal_length])
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token

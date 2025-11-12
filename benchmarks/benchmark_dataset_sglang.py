@@ -136,7 +136,6 @@ def main(world_size, rank, gpu_id, args):
 
     else:
         decoder = HierarchyDecoder(temperature=0, threshold=args.threshold, low_threshold=args.low_threshold, mask_id=156895, eos_id=156892)
-    warmup_decoder = ThresholdParallelDecoder(temperature=0, threshold=0.2, mask_id=156895, eos_id=156892)
     use_sw = args.prefix_look > 0 or args.after_look > 0 or args.warmup_times > 0
     if args.cache == 'prefix' or args.cache == 'dual':
         cache_factory=KVCacheFactory(args.cache, is_bd_model=args.use_bd, backend='sglang', max_length=max_length)
@@ -144,7 +143,6 @@ def main(world_size, rank, gpu_id, args):
         cache_factory=None
 
     if not args.use_bd:
-        warmup_dllm = None
         if args.cont_weight>0:
             if use_sw:
                 dllm = IterSmoothWithVicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,
@@ -157,10 +155,8 @@ def main(world_size, rank, gpu_id, args):
                     prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
             else:
                 dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=args.use_shift)
-                warmup_dllm = BlockWiseDiffusionLLM(model, warmup_decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=False, use_shift=args.use_shift)
     else:
         dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=cache_factory, early_stop=True, maximum_unroll=4, expected_tpf=4, backend='sglang')
-        warmup_dllm = BlockDiffusionLLM(model, warmup_decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=cache_factory, early_stop=False, maximum_unroll=4, expected_tpf=4, backend='sglang')
 
     batch_size = args.batch_size
     
