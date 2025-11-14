@@ -38,8 +38,8 @@ dInfer supports multiple dLLM variants, including LLaDA and LLaDA-MoE.
 
 ## Contents
 - [Supported Models](#supported-models)
+- [Quick Start](#quick-start)
 - [Benchmark Results](#benchmark-results)
-- [Getting Started](#getting-started)
 
 ## Supported Models
 
@@ -90,26 +90,9 @@ dInfer supports multiple diffusion language model variants with different archit
 - Optimized for single-GPU and multi-GPU inference
 - **Decoding algorithms**: Hierarchical, Credit, Threshold
 
+## Quick Start
 
-## Benchmark Results
-
-<p align="center">
-  <img src="assets/dinfer_tps.png" alt="dInfer v0.1 speedup" width="600">
-  <br>
-  <b>Figure</b>: Benchmark results
-</p>
-
-**Performance on HumanEval:**
-- Over 1,100 TPS at batch size 1
-- Averages 800+ TPS across six benchmarks on a single node with 8× H800 GPUs
-
-**Speedup comparisons:**
-- 10× faster than Fast-dLLM while maintaining accuracy
-- 2-3× faster than Qwen2.5-3B on vLLM (LLaDA-MoE) with comparable quality
-
-## Getting Started
-
-Please follow the instructions below to install dInfer.
+### Install dInfer
 
 ```
 git clone https://github.com/inclusionAI/dInfer.git
@@ -117,41 +100,26 @@ cd dInfer
 pip install .
 ```
 
-### Download from HuggingFace and Convert to FusedMoE Format
+### Convert to FusedMoE (MoE models only)
 
-This project supports using LLaDA and LLaDA-MoE checkpoints from HuggingFace. After downloading a model, run the conversion script to fuse MoE experts into FusedMoE format for local loading.
-
-#### 1) Download checkpoints
+#### 1) Download and Convert
 
 ```bash
 pip install -U huggingface_hub hf_transfer
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-# Example: download Instruct checkpoint
+# Download Instruct checkpoint
 hf download inclusionAI/LLaDA-MoE-7B-A1B-Instruct \
   --repo-type model \
   --local-dir /path/to/LLaDA-MoE-7B-A1B-Instruct
-```
 
-#### 2) Convert to FusedMoE format
-**(For LLada2.0-mini/flash, this step should be skipped.)**
-
-Use the conversion tool to fuse MoE experts.
-
-```bash
-# From repo root
+# Convert to FusedMoE
 python -m tools.transfer.py \
   --input  /path/to/LLaDA-MoE-7B-A1B-Instruct \
   --output /path/to/LLaDA-MoE-7B-A1B-Instruct-fused
 ```
 
-**After conversion, the output directory contains:**
-- `modeling_fused_olmoe.py`
-- `config.json` with:
-  - `architectures: [FusedOlmoeForCausalLM]`
-  - `auto_map.AutoModelForCausalLM: modeling_fused_olmoe.FusedOlmoeForCausalLM`
-
-#### 3) Load the model
+#### 2) Load the model
 
 - **Load via Auto classes:**
 ```python
@@ -162,10 +130,10 @@ tok = AutoTokenizer.from_pretrained(m, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dtype="bfloat16")
 ```
 
-### Tutorial
+### Run Inference
 
-- **Benchmark-only (speed)** — scripts in `benchmarks/`
-  - Measure throughput (TPS) only; predictions are saved under `--output_dir`; no automatic scoring.
+- **Benchmark (speed only)**
+  - Measure throughput (TPS) only; predictions are saved under `--output_dir` with no automatic scoring.
   - Example 1 (LLaDA-MoE, threshold decoder, TP across 4 GPUs):
   ```bash
   python benchmarks/benchmark_dataset.py \
@@ -186,9 +154,7 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
     --cont_weight 0.3
   ```
   - Example 2 (LLaDA-8B-Instruct, threshold decoder, TP across 4 GPUs):
-  - **Currently, we only support up to 4-way parallelism for LLaDA dense since the number of heads is 4.**
-  > ⚠️ **Note**: For LLaDA dense models, `--use_bd` is not supported.
-  ```
+  ```bash
   python benchmarks/benchmark.py \
     --model_name GSAI-ML/LLaDA-8B-Instruct \
     --model_type llada \
@@ -201,8 +167,7 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
     --cache prefix
   ```
   - Example 3 (LLaDA2-flash, threshold decoder, TP across 4 GPUs):
-  -  **Currently, we only support up to 4-way parallelism for LLaDA2 since the number of heads is 4.**
-  ```shell
+  ```bash
     python benchmarks/benchmark_dataset.py \
       --model_name inclusionAI/LLaDA2.0-flash-preview \
       --model_type llada2 \
@@ -218,31 +183,49 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
       --use_bd
   ```
  
-  - Other entry points:
-    - `benchmark.py` — Single-sample profiling.
-    - Example 1 (LLaDA2-mini, threshold decoder, TP across 4 GPUs):
-    ```shell
-    python benchmarks/benchmark.py \
-      --model_name inclusionAI/LLaDA2.0-mini-preview \
-      --model_type llada2 \
-      --gen_len 2048 \
-      --block_length 32 \
-      --gpu 0,1,2,3 \
-      --use_tp \
-      --parallel_decoding threshold \
-      --threshold 0.9 \
-      --cache prefix \
-      --use_bd
-    ```
+  - Example 4: Single-sample profiling (LLaDA2-mini, threshold decoder, TP across 4 GPUs):
+  ```bash
+  python benchmarks/benchmark.py \
+    --model_name inclusionAI/LLaDA2.0-mini-preview \
+    --model_type llada2 \
+    --gen_len 2048 \
+    --block_length 32 \
+    --gpu 0,1,2,3 \
+    --use_tp \
+    --parallel_decoding threshold \
+    --threshold 0.9 \
+    --cache prefix \
+    --use_bd
+  ```
 
 
-- **End-to-end evaluation (speed + accuracy)** — scripts in `evaluations/`
+- **Evaluation (speed + accuracy)**
   - Built on HuggingFace `lm-eval-harness`; computes both TPS and benchmark scores.
   - Tasks provided:
     - `gsm8k_llada`: math reasoning.
     - `mbpp_sanitized_llada`: sanitized Python code generation.
   - For more examples and comprehensive instructions, see [our quickstart guide](evaluations/eval_guide.md).
-  - Currently, the evaluation configuration is only aligned with LLaDA-MoE, `lm-eval` evaluations for llada2-mini/flash and other models will be updated later.
+ 
+## Benchmark Results
+
+<p align="center">
+  <img src="assets/dinfer_tps.png" alt="dInfer v0.1 speedup" width="600">
+  <br>
+  <b>Figure</b>: Benchmark results
+</p>
+
+**Performance on HumanEval:**
+- Over 1,100 TPS at batch size 1
+- Averages 800+ TPS across six benchmarks on a single node with 8× H800 GPUs
+
+**Speedup comparisons:**
+- 10× faster than Fast-dLLM while maintaining accuracy
+- 2-3× faster than Qwen2.5-3B on vLLM (LLaDA-MoE) with comparable quality
+
+## Limitations
+- **LLaDA2**: Max 4-way TP (due to 4 attention heads)
+- **Block Diffusion**: Not supported on LLaDA Dense/MoE models (use `--use_bd` with LLaDA2 only)
+- **Evaluation**: `lm-eval` evaluations currently configured for LLaDA-MoE only.
 
 ## Contact us
 - Wechat Group
