@@ -17,4 +17,5 @@ for the dInfer project. For now, you can start with the installation guide.
    :caption: Getting Started
 
    start/install
+   start/quickstart
 
