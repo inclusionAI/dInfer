@@ -4,390 +4,94 @@
 Quickstart
 ==========
 
-Last updated: 2025-11-13
+Last updated: 2025-11-20
 
-This page shows minimal single-GPU inference, MoE usage notes, advanced decoding
-variants, and performance tips for **dInfer**.
+This page provides **minimal runnable examples** for different dInfer model
+families on a single GPU:
 
-.. note::
+- Dense LLaDA models
+- LLaDA-MoE models (fused MoE via vLLM)
+- LLaDA2 block-diffusion models
 
-   The examples below assume you have installed dInfer (see :ref:`installation`)
-   and have a CUDA-enabled environment. Some snippets call third-party libraries
-   (e.g., ``transformers``, ``vllm``). Install them as needed for your setup.
+For advanced decoding strategies and performance tuning, see
+:ref:`quickstart_next`.
 
------------------------------
-1. Basic Single-GPU Inference
------------------------------
+.. contents::
+   :local:
+   :depth: 2
 
-A minimal example to get started with dInfer:
+-----------------------------------
+1. Dense LLaDA (Single-GPU)
+-----------------------------------
+
+This is the simplest way to get started with dInfer using a dense LLaDA model.
 
 .. code-block:: python
 
    import torch
    from transformers import AutoTokenizer, AutoConfig
    from dinfer.model import LLaDAModelLM
-   from dinfer import BlockIteratorFactory, KVCacheFactory
+   from dinfer import BlockIteratorFactory
    from dinfer import ThresholdParallelDecoder, BlockWiseDiffusionLLM
 
-   # Set device
+   # 1. Device
    device = torch.device("cuda:0")
 
-   # Load from local path
+   # 2. Local model path
    model_name = "/path/to/local/LLaDA-8B-Instruct"
 
-   # Load tokenizer and model
+   # 3. Load tokenizer and model
    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
    model = LLaDAModelLM.from_pretrained(
        model_name,
        torch_dtype=torch.bfloat16,
-       init_device=str(device)
+       init_device=str(device),
    ).eval().to(device)
 
-   # Configure decoder with threshold-based parallel decoding
+   # 4. Configure decoder (threshold-based parallel decoding)
    mask_id = 126336  # LLaDA mask token ID
    eos_id  = 126081  # LLaDA EOS token ID
+
    decoder = ThresholdParallelDecoder(
        temperature=0.0,   # Greedy decoding
        threshold=0.9,     # Confidence threshold for token acceptance
        mask_id=mask_id,
-       eos_id=eos_id
+       eos_id=eos_id,
    )
 
-   # Initialize diffusion LLM with block iterator
+   # 5. Initialize diffusion LLM
    dllm = BlockWiseDiffusionLLM(
        model=model,
        decoder=decoder,
        iterator_factory=BlockIteratorFactory(start_block_align=True),
        cache_factory=None,   # No KV cache for basic usage
-       early_stop=True       # Stop when EOS is generated
+       early_stop=True,      # Stop when EOS is generated
    )
 
-   # Prepare input
+   # 6. Prepare input
    prompt = "What is the capital of France?"
-   input_ids = tokenizer(prompt)['input_ids']
-   input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
+   inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-   # Generate
+   # 7. Generate
    with torch.no_grad():
-       output = dllm.generate(
-           input_ids,
-           gen_length=256,      # Maximum generation length
-           block_length=64      # Block size for parallel decoding
+       output_ids = dllm.generate(
+           inputs["input_ids"],
+           gen_length=256,     # Maximum new tokens
+           block_length=64,    # Block size for parallel decoding
        )
 
-   # Decode output
-   generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+   # 8. Decode output
+   generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
    print(f"Generated: {generated_text}")
 
---------------------------------
-1.1 Basic LLaDA-MoE Inference
---------------------------------
-
-For Mixture-of-Experts models, use the fused implementation with proper vLLM configuration:
-
-.. code-block:: python
-
-   import os
-   import torch
-   from transformers import AutoTokenizer, AutoConfig
-   from vllm import distributed
-   from vllm.config import ParallelConfig, VllmConfig
-   from vllm.config import set_current_vllm_config
-   from dinfer.model import FusedOlmoeForCausalLM
-   from dinfer import ThresholdParallelDecoder, BlockWiseDiffusionLLM, BlockIteratorFactory
-
-   # Setup device
-   gpu_id = 0
-   torch.cuda.set_device(gpu_id)
-   device = torch.device(f"cuda:{gpu_id}")
-
-   # Load model from local path
-   model_name = "/path/to/local/LLaDA-MoE-7B-A1B-Instruct"
-
-   # Load tokenizer
-   tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-
-   # Initialize vLLM distributed environment (even for single GPU)
-   world_size = 1
-   rank = 0
-   os.environ['MASTER_ADDR'] = 'localhost'
-   os.environ['MASTER_PORT'] = '45601'
-   distributed.init_distributed_environment(world_size, rank, 'env://', rank, 'nccl')
-   distributed.initialize_model_parallel(world_size, backend='nccl')
-
-   # Expert Parallelism (required for MoE models)
-   parallel_config = ParallelConfig(enable_expert_parallel=True)
-   with set_current_vllm_config(VllmConfig(parallel_config=parallel_config)):
-       print("Loading model with EP enabled...")
-
-       model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-       model = FusedOlmoeForCausalLM(config=model_config).eval()
-       model.load_weights(model_name, torch_dtype=torch.bfloat16)
-       model = model.to(device)
-
-       # MoE uses different special token IDs
-       mask_id = 156895
-       eos_id  = 156892
-
-       decoder = ThresholdParallelDecoder(
-           temperature=0.0,
-           threshold=0.9,
-           mask_id=mask_id,
-           eos_id=eos_id
-       )
-
-       dllm = BlockWiseDiffusionLLM(
-           model=model,
-           decoder=decoder,
-           iterator_factory=BlockIteratorFactory(start_block_align=True),
-           early_stop=True
-       )
-
-       # Generate
-       prompt = "Explain quantum computing in simple terms."
-       input_ids = tokenizer(prompt)['input_ids']
-       input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
-
-       with torch.no_grad():
-           output = dllm.generate(input_ids, gen_length=512, block_length=64)
-
-       generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-       print(generated_text)
-
-.. important::
-
-   - Initialize the vLLM distributed environment **even on single GPU**.
-   - Use ``ParallelConfig(enable_expert_parallel=True)`` for MoE models.
-   - Keep all model operations inside ``set_current_vllm_config(...)`` context.
-
-------------------------------
-1.2 Understanding Parameters
-------------------------------
-
-- **``gen_length``**: Maximum number of tokens to generate.
-- **``block_length``**: Number of tokens decoded in parallel per diffusion iteration.
-  
-  - Larger values → more parallelism but potentially lower quality.
-  - Typical range: **32–128**.
-
-- **``threshold``**: Confidence threshold (0.0–1.0) for accepting decoded tokens.
-  
-  - Higher → more conservative, higher quality, more iterations.
-  - Lower → more aggressive, faster but potentially lower quality.
-
--------------------------------------
-2. Advanced Decoding Algorithms (DL)
--------------------------------------
-
-2.1 Hierarchical Decoding
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-   from dinfer import HierarchyDecoder
-
-   decoder = HierarchyDecoder(
-       temperature=0.0,
-       threshold=0.9,      # High confidence threshold
-       low_threshold=0.3,  # Low confidence threshold
-       mask_id=mask_id,
-       eos_id=eos_id
-   )
-
-   dllm = BlockWiseDiffusionLLM(
-       model=model,
-       decoder=decoder,
-       iterator_factory=BlockIteratorFactory(start_block_align=True),
-       early_stop=True
-   )
-
-   output = dllm.generate(input_ids, gen_length=512, block_length=64)
-
-**How it works:**
-
-- Tokens with confidence > ``threshold`` are immediately accepted.
-- Tokens with confidence < ``low_threshold`` remain masked.
-- Intermediate-confidence tokens are accepted if they are local maxima in masked regions.
-
-2.2 Credit-Based Threshold Decoding
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-   from dinfer import CreditThresholdParallelDecoder
-
-   decoder = CreditThresholdParallelDecoder(
-       temperature=0.0,
-       threshold=0.9,
-       mask_id=mask_id,
-       eos_id=eos_id
-   )
-
-   dllm = BlockWiseDiffusionLLM(
-       model=model,
-       decoder=decoder,
-       iterator_factory=BlockIteratorFactory(start_block_align=True),
-       early_stop=True
-   )
-   output = dllm.generate(input_ids, gen_length=512, block_length=64)
-
-**Benefits:**
-
-- Accumulates "credits" for consistently high-confidence tokens.
-- Reduces premature acceptance in difficult regions.
-- Stabilizes convergence on challenging prompts.
-
-2.3 Iterative Smoothing with Vicinity Cache
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-   from dinfer import IterSmoothWithVicinityCacheDiffusionLLM, KVCacheFactory
-
-   cache_factory = KVCacheFactory(
-       cache_type='dual',     # prefix + suffix refresh
-       is_bd_model=False
-   )
-
-   dllm = IterSmoothWithVicinityCacheDiffusionLLM(
-       model=model,
-       decoder=decoder,
-       iterator_factory=BlockIteratorFactory(start_block_align=True),
-       cache_factory=cache_factory,
-       early_stop=True,
-       cont_weight=0.3,       # Continuity regularization
-       prefix_look=16,        # Look-back context size
-       after_look=16,         # Look-ahead context size
-       warmup_steps=4
-   )
-   output = dllm.generate(input_ids, gen_length=512, block_length=64)
-
-**Key parameters:**
-
-- ``cont_weight`` (0.0–1.0): larger → smoother token transitions.
-- ``prefix_look``: tokens to look back for context.
-- ``after_look``: tokens to look ahead for context.
-- ``warmup_steps``: iterations with full diffusion at the start.
-
-2.4 Block Diffusion (LLaDA2.0 Models)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-   import torch
-   from transformers import AutoConfig
-   from dinfer.model import LLaDA2MoeModelLM
-   from dinfer import BlockDiffusionLLM, KVCacheFactory, BlockIteratorFactory, ThresholdParallelDecoder
-
-   device = torch.device("cuda:0")
-   model_name = "/path/to/local/LLaDA2.0-mini-preview"
-
-   # Load LLaDA2 model
-   model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-   model = LLaDA2MoeModelLM(config=model_config).eval()
-   model.load_weights(model_name, torch_dtype=torch.bfloat16, device=device)
-   model = model.to(device)
-
-   mask_id = 156895
-   eos_id  = 156892
-
-   decoder = ThresholdParallelDecoder(
-       temperature=0.0,
-       threshold=0.9,
-       mask_id=mask_id,
-       eos_id=eos_id
-   )
-
-   cache_factory = KVCacheFactory(cache_type='prefix', is_bd_model=True)
-
-   dllm = BlockDiffusionLLM(
-       model=model,
-       decoder=decoder,
-       iterator_factory=BlockIteratorFactory(
-           start_block_align=True,
-           use_block_diffusion=True  # Enable block diffusion mode
-       ),
-       cache_factory=cache_factory,
-       early_stop=True
-   )
-
-   output = dllm.generate(input_ids, gen_length=2048, block_length=32)
-
-2.5 KV Cache Strategies
-~~~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-   from dinfer import KVCacheFactory, BlockWiseDiffusionLLM, BlockIteratorFactory
-
-   # Option 1: Prefix caching only (common for causal LMs)
-   cache_factory = KVCacheFactory(cache_type='prefix', is_bd_model=False)
-
-   # Option 2: Dual caching (prefix + suffix refresh)
-   cache_factory = KVCacheFactory(cache_type='dual', is_bd_model=False)
-
-   # Option 3: No caching (simplest, but slower)
-   cache_factory = None
-
-   dllm = BlockWiseDiffusionLLM(
-       model=model,
-       decoder=decoder,
-       iterator_factory=BlockIteratorFactory(start_block_align=True),
-       cache_factory=cache_factory,
-       early_stop=True
-   )
-
-**Cache Type Comparison**
-
-- ``prefix``: caches prompt/fixed prefix; best for single-turn, low memory.
-- ``dual``: caches prefix + refreshes vicinity tokens; best for complex/multi-turn, medium memory.
-- ``None``: recompute everything; fine for very short sequences.
-
---------------------------------------------
-3. Performance Optimization: Practical Tips
---------------------------------------------
-
-3.1 ``torch.compile()`` (Fusion & CUDA Graphs)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-   import torch
-
-   # Enable torch.compile on model forward pass
-   model.forward = torch.compile(
-       model.forward,
-       mode='reduce-overhead',  # Enables CUDA Graph capture on stable regions
-       fullgraph=False,
-       dynamic=True
-   )
-
-**Shape signatures & warmup**
-
-- CUDA Graphs are compiled per input signature (shape/stride/dtype/device).
-- The first iteration for a *new* signature incurs extra compile/capture time.
-- Warm up before timing:
-
-.. code-block:: python
-
-   # Warmup to populate CUDA Graphs
-   for _ in range(2):
-       _ = dllm.generate(input_ids, gen_length=256, block_length=64)
-
-   # Measure steady-state
-   output = dllm.generate(input_ids, gen_length=512, block_length=64)
-
-**Guidance**
-
-- Bucket/pad prompts to a small set of lengths (multiples of 16/32).
-- Keep ``block_length`` fixed across runs when comparing speed.
-- If shapes vary wildly or runs are short, use ``mode='default'`` (fusion only).
-
-3.2 Tensor Parallelism (Multi-GPU)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Skeleton for TP with vLLM:
+-----------------------------------
+2. LLaDA-MoE (Single-GPU, fused)
+-----------------------------------
+
+LLaDA-MoE models use a fused MoE implementation in dInfer, with vLLM providing
+the distributed/expert-parallel runtime. Even on **one GPU**, vLLM's
+distributed environment must be initialized.
 
 .. code-block:: python
 
@@ -399,64 +103,187 @@ Skeleton for TP with vLLM:
    from dinfer.model import FusedOlmoeForCausalLM
    from dinfer import ThresholdParallelDecoder, BlockWiseDiffusionLLM, BlockIteratorFactory
 
-   def setup_model_with_tp(world_size, rank, gpu_id, model_name):
-       """Setup model with tensor parallelism"""
+   # 1. Device
+   gpu_id = 0
+   torch.cuda.set_device(gpu_id)
+   device = torch.device(f"cuda:{gpu_id}")
 
-       torch.cuda.set_device(gpu_id)
-       device = torch.device(f"cuda:{gpu_id}")
+   # 2. Local model path
+   model_name = "/path/to/local/LLaDA-MoE-7B-A1B-Instruct"
 
-       tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+   # 3. Load tokenizer
+   tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
-       os.environ['MASTER_ADDR'] = 'localhost'
-       os.environ['MASTER_PORT'] = str(45601)
+   # 4. Initialize vLLM distributed environment (even for single GPU)
+   world_size = 1
+   rank = 0
+   os.environ["MASTER_ADDR"] = "localhost"
+   os.environ["MASTER_PORT"] = "45601"
 
-       distributed.init_distributed_environment(world_size, rank, 'env://', rank, 'nccl')
-       distributed.initialize_model_parallel(world_size, backend='nccl')
+   distributed.init_distributed_environment(
+       world_size=world_size,
+       rank=rank,
+       init_method="env://",
+       local_rank=rank,
+       backend="nccl",
+   )
+   distributed.initialize_model_parallel(world_size, backend="nccl")
 
-       print(f"[Rank {rank}] Loading model with TP={world_size}")
+   # 5. Enable expert parallelism (EP)
+   parallel_config = ParallelConfig(enable_expert_parallel=True)
+   with set_current_vllm_config(VllmConfig(parallel_config=parallel_config)):
+       print("Loading LLaDA-MoE model with EP enabled...")
 
-       parallel_config = ParallelConfig(enable_expert_parallel=True)
-       with set_current_vllm_config(VllmConfig(parallel_config=parallel_config)):
-           model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+       model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+       model = FusedOlmoeForCausalLM(config=model_config).eval()
+       model.load_weights(model_name, torch_dtype=torch.bfloat16)
+       model = model.to(device)
 
-           model = FusedOlmoeForCausalLM(config=model_config).eval()
-           model.load_weights(model_name, torch_dtype=torch.bfloat16)
+       # MoE-specific special token IDs
+       mask_id = 156895
+       eos_id  = 156892
 
-           if world_size > 1:
-               print(f"[Rank {rank}] Enabling TP")
-               model.tensor_parallel(tp_size=world_size)
+       decoder = ThresholdParallelDecoder(
+           temperature=0.0,
+           threshold=0.9,
+           mask_id=mask_id,
+           eos_id=eos_id,
+       )
 
-           model = model.to(device)
+       dllm = BlockWiseDiffusionLLM(
+           model=model,
+           decoder=decoder,
+           iterator_factory=BlockIteratorFactory(start_block_align=True),
+           early_stop=True,
+       )
 
-           # Optional: compile for performance
-           model.forward = torch.compile(
-               model.forward, mode='reduce-overhead', fullgraph=False, dynamic=True
-           )
+       # 6. Generate
+       prompt = "Explain quantum computing in simple terms."
+       input_ids = tokenizer(prompt)["input_ids"]
+       input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
-           # Typical decoder setup (IDs depend on model)
-           mask_id, eos_id = 156895, 156892
-           decoder = ThresholdParallelDecoder(
-               temperature=0.0, threshold=0.9, mask_id=mask_id, eos_id=eos_id
-           )
+       with torch.no_grad():
+           output = dllm.generate(input_ids, gen_length=512, block_length=64)
 
-           dllm = BlockWiseDiffusionLLM(
-               model=model,
-               decoder=decoder,
-               iterator_factory=BlockIteratorFactory(start_block_align=True),
-               early_stop=True
-           )
-           return dllm, tokenizer, device
+       generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+       print(generated_text)
 
-**Key points**
+.. important::
 
-- Initialize vLLM distributed env **before** loading the model.
-- ``initialize_model_parallel(world_size)`` sets up TP groups.
-- Call ``model.tensor_parallel(tp_size)`` after loading weights.
+   - vLLM distributed environment must be initialized even for **single-GPU**
+     MoE inference.
+   - ``ParallelConfig(enable_expert_parallel=True)`` is required for MoE.
+   - Mask/EOS token IDs for MoE models usually differ from dense LLaDA.
 
------------------
-4. What’s Next?
------------------
+-----------------------------------
+3. LLaDA2 (Block Diffusion)
+-----------------------------------
 
-- See :ref:`installation` for environment/setup details.
-- Add your first dataset or evaluation and try the advanced decoders above.
-- When you add more guides, include them in the :doc:`index </index>` to appear in the sidebar.
+LLaDA2.x models are trained with **block diffusion** and should be wrapped with
+``BlockDiffusionLLM`` in dInfer.
+
+.. code-block:: python
+
+   import torch
+   from transformers import AutoTokenizer, AutoConfig
+   from dinfer.model import LLaDA2MoeModelLM
+   from dinfer import (
+       BlockDiffusionLLM,
+       BlockIteratorFactory,
+       KVCacheFactory,
+       ThresholdParallelDecoder,
+   )
+
+   # 1. Device
+   device = torch.device("cuda:0")
+
+   # 2. Local model path
+   model_name = "/path/to/local/LLaDA2.0-mini-preview"
+
+   # 3. Load tokenizer and model
+   tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+   model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+   model = LLaDA2MoeModelLM(config=model_config).eval()
+   model.load_weights(model_name, torch_dtype=torch.bfloat16, device=device)
+   model = model.to(device)
+
+   # 4. Special tokens for LLaDA2
+   mask_id = 156895
+   eos_id  = 156892
+
+   decoder = ThresholdParallelDecoder(
+       temperature=0.0,
+       threshold=0.9,
+       mask_id=mask_id,
+       eos_id=eos_id,
+   )
+
+   # LLaDA2 typically uses prefix cache with block-diffusion flag
+   cache_factory = KVCacheFactory(cache_type="prefix", is_bd_model=True)
+
+   dllm = BlockDiffusionLLM(
+       model=model,
+       decoder=decoder,
+       iterator_factory=BlockIteratorFactory(
+           start_block_align=True,
+           use_block_diffusion=True,  # Enable block diffusion mode
+       ),
+       cache_factory=cache_factory,
+       early_stop=True,
+   )
+
+   prompt = "Summarize the key ideas of diffusion language models."
+   inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+   with torch.no_grad():
+       output_ids = dllm.generate(
+           inputs["input_ids"],
+           gen_length=2048,
+           block_length=32,
+       )
+
+   print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+
+----------------------
+4. Key Parameters
+----------------------
+
+Across all models, the following parameters are the most important knobs:
+
+- ``gen_length``  
+  Maximum number of **new tokens** to generate.
+  Typical range: ``256–2048``.
+
+- ``block_length``  
+  Number of tokens decoded in parallel per diffusion iteration.
+
+  - Larger values → more parallelism, higher speed, potentially lower quality.
+  - Typical range: ``32–128`` to start with.
+
+- ``threshold`` (decoder)  
+  Confidence threshold (0.0–1.0) for accepting decoded tokens.
+
+  - Higher → more conservative, higher quality, more iterations.
+  - Lower → more aggressive, faster but potentially lower quality.
+
+.. tip::
+
+   A good starting point is:
+   ``block_length = 64`` and ``threshold = 0.9``.
+   Lower the threshold for speed; increase it for quality.
+
+.. _quickstart_next:
+
+----------------
+5. Next Steps
+----------------
+
+Once you can run the basic examples above, you can explore:
+
+- :doc:`Advanced decoding algorithms <advanced_decoding>`  
+  (hierarchical decoding, credit-based decoding, iterative smoothing,
+  block diffusion details, KV cache strategies)
+
+- :doc:`Performance tuning <performance>`  
+  (``torch.compile``, CUDA Graphs, prompt bucketing, tensor parallelism,
+  multi-GPU benchmarks)

@@ -19,3 +19,10 @@ for the dInfer project. For now, you can start with the installation guide.
    start/install
    start/quickstart
 
+.. toctree::
+   :maxdepth: 2
+   :caption: Advanced Usage
+
+   start/advanced_decoding
+   start/performance
+

@@ -7,7 +7,7 @@
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = 'dInfer'
-copyright = '2025, Lun Du'
+copyright = '2025, dInfer Team'
 author = 'Lun Du'
 
 # -- General configuration ---------------------------------------------------
