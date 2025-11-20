@@ -3,7 +3,7 @@ name: Build & Deploy Sphinx Docs
 on:
   push:
     branches:
-      - add_docs        # 你现在的文档分支
+      - add_docs
   workflow_dispatch:
 
 permissions:
