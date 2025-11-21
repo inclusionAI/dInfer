@@ -4,14 +4,14 @@
 Quickstart
 ==========
 
-Last updated: 2025-11-20
+Last updated: 2025-11-21
 
 This page provides **minimal runnable examples** for different dInfer model
 families on a single GPU:
 
-- Dense LLaDA models
-- LLaDA-MoE models (fused MoE via vLLM)
-- LLaDA2 block-diffusion models
+- Dense LLaDA models (LLaDA-Base, LLaDA-Instruct, and LLaDA1.5)
+- LLaDA-MoE models
+- LLaDA2 block-diffusion models (mini/flash)
 
 For advanced decoding strategies and performance tuning, see
 :ref:`quickstart_next`.
@@ -71,7 +71,7 @@ This is the simplest way to get started with dInfer using a dense LLaDA model.
 
    # 6. Prepare input
    prompt = "What is the capital of France?"
-   inputs = tokenizer(prompt, return_tensors="pt").to(device)
+   inputs = tokenizer(prompt).to(device)
 
    # 7. Generate
    with torch.no_grad():
@@ -173,7 +173,7 @@ distributed environment must be initialized.
    - vLLM distributed environment must be initialized even for **single-GPU**
      MoE inference.
    - ``ParallelConfig(enable_expert_parallel=True)`` is required for MoE.
-   - Mask/EOS token IDs for MoE models usually differ from dense LLaDA.
+   - Mask/EOS token IDs for MoE models differ from dense LLaDA.
 
 -----------------------------------
 3. LLaDA2 (Block Diffusion)
@@ -268,9 +268,8 @@ Across all models, the following parameters are the most important knobs:
 
 .. tip::
 
-   A good starting point is:
-   ``block_length = 64`` and ``threshold = 0.9``.
-   Lower the threshold for speed; increase it for quality.
+   - A good starting point is: ``block_length = 64`` and ``threshold = 0.9``. Lower the threshold for speed; increase it for quality.
+   - For LLaDA2, the `block_length`` should ideally be set to 32, as this is consistent with the training setup and yields the best performance.
 
 .. _quickstart_next:
 
@@ -285,5 +284,5 @@ Once you can run the basic examples above, you can explore:
   block diffusion details, KV cache strategies)
 
 - :doc:`Performance tuning <performance>`  
-  (``torch.compile``, CUDA Graphs, prompt bucketing, tensor parallelism,
+  (CUDA Graphs, prompt bucketing, tensor parallelism,
   multi-GPU benchmarks)

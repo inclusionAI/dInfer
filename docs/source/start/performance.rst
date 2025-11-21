@@ -4,17 +4,17 @@
 Performance Tuning in dInfer
 ===========================
 
-Last updated: 2025-11-20
+Last updated: 2025-11-21
 
 This page covers practical performance optimizations for dInfer, focusing on:
 
-- ``torch.compile`` (kernel fusion + CUDA Graphs)
+- Kernel fusion + CUDA Graphs
 - Prompt/shape management
 - Tensor parallelism (multi-GPU)
 - A complete multi-GPU benchmark script
 
 ---------------------------------------------
-1. ``torch.compile``: Fusion & CUDA Graphs
+1. Fusion & CUDA Graphs
 ---------------------------------------------
 
 PyTorch 2.0+ supports both **kernel fusion** and **CUDA Graph capture**
