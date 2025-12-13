@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+*.egg
+.venv
+venv
+ENV
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Build artifacts
+build
+dist
+
+# Testing
+.pytest_cache
+.coverage
+htmlcov
+
+# Documentation and assets (not needed at runtime)
+assets
+*.md
+!README.md
+
+# Tests (optional - include if you want to run tests in container)
+# tests
+
+# OS files
+.DS_Store
+Thumbs.db
