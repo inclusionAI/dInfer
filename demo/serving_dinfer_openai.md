@@ -3,6 +3,7 @@
 ## Serving
 
 ```bash
+export SPECIAL_MODEL_DIR=/models/LLaDA2.0-mini--572899f-C8 # Download from https://www.modelscope.cn/models/inclusionAI/LLaDA2.0-mini
 export TASK_DLLM_BATCH_SIZE=2
 python3 serving_dinfer_openai.py
 ```
