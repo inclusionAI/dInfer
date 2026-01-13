@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 import uuid
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field
 import torch
@@ -39,12 +40,12 @@ def init_logger(log_path: str = None):
                 return super().format(record)
             except TypeError:
                 if hasattr(record, 'args') and record.args:
-                    record.msg = f"{record.msg} - Unformattable args: {record.args}"
+                    record.msg = f'{record.msg} - Unformattable args: {record.args}'
                     record.args = ()
                 return super().format(record)
 
-    task_logging_level = os.environ.get("TASK_LOGGING_LEVEL", "INFO")
-    log_level = logging.INFO if task_logging_level == "INFO" else logging.DEBUG
+    task_logging_level = os.environ.get('TASK_LOGGING_LEVEL', 'INFO')
+    log_level = logging.INFO if task_logging_level == 'INFO' else logging.DEBUG
     logging.basicConfig(filename=log_path,
                         level=log_level,
                         format=log_format,
@@ -79,10 +80,18 @@ app = FastAPI(
     redoc_url=None,
     docs=None,
 )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=['*'],
+    allow_methods=['*'],
+    allow_headers=['*'],
+)
 STATUS_OK = 1
 STATUS_ERR = 0
 
 SPECIAL_MODEL_DIR = os.environ.get('SPECIAL_MODEL_DIR')
+TASK_DLLM_SERVE_MODEL_NAME = os.environ.get('TASK_DLLM_SERVE_MODEL_NAME',
+                                            'xyz-dllm')
 TASK_DLLM_NUM_GPUS = int(os.environ.get('TASK_DLLM_NUM_GPUS', 1))
 
 TASK_DLLM_GEN_LENGTH = int(os.environ.get('TASK_DLLM_GEN_LENGTH', 512))
@@ -199,7 +208,7 @@ def generate_in_background(chat_uuid: str, data: Dict):
             stream_put_api(chat_uuid, None)
 
         except Exception as err:
-            logging.error("Generate error: %s", err)
+            logging.error('Generate error: %s', err)
             stream_put_api(chat_uuid, None)
 
     thread = threading.Thread(target=_generate, daemon=True)
@@ -212,6 +221,7 @@ def get_answer_openai(chat_uuid: str, data: Dict) -> str:
     generate_in_background(chat_uuid, data)
     resp = {}
 
+    pre_text = ''
     while True:
         curr_x = stream_get_api(chat_uuid)
 
@@ -234,12 +244,12 @@ def get_answer_openai(chat_uuid: str, data: Dict) -> str:
             'created':
             time.time(),
             'model':
-            'xyz-dllm',
+            TASK_DLLM_SERVE_MODEL_NAME,
             'choices': [{
                 'index': 0,
                 'delta': {
                     'role': 'assistant',
-                    'content': text,
+                    'content': text[len(pre_text):],
                     'resoning_content': None
                 },
                 'logprobs': None,
@@ -248,13 +258,17 @@ def get_answer_openai(chat_uuid: str, data: Dict) -> str:
             'prompt_token_ids':
             None
         }
-        yield 'data: ' + json.dumps(resp, ensure_ascii=False) + '\n'
+        pre_text = text
+        yield 'data: ' + json.dumps(resp, ensure_ascii=False) + '\n\n'
 
-    logging.info('[%s] resp: %s', chat_uuid, resp)
+    yield 'data: [DONE]'
 
     with stream_lock:
         if chat_uuid in global_stream_dict:
             del global_stream_dict[chat_uuid]
+
+    resp['choices'][0]['delta']['content'] = pre_text
+    logging.info('[%s] resp: %s', chat_uuid, resp)
 
 
 def get_answer_openai_no_stream(chat_uuid: str, data: Dict) -> str:
@@ -290,7 +304,7 @@ def get_answer_openai_no_stream(chat_uuid: str, data: Dict) -> str:
         'created':
         time.time(),
         'model':
-        'xyz-dllm',
+        TASK_DLLM_SERVE_MODEL_NAME,
         'choices': [{
             'index': 0,
             'message': {
@@ -303,11 +317,11 @@ def get_answer_openai_no_stream(chat_uuid: str, data: Dict) -> str:
         }],
         'prompt_token_ids':
         None,
-        "usage": {
-            "prompt_tokens": input_ids.shape[-1],
-            "total_tokens": len(x_tokens_final[0]),
-            "completion_tokens": len(x_tokens_final[0]) - input_ids.shape[-1],
-            "prompt_tokens_details": None
+        'usage': {
+            'prompt_tokens': input_ids.shape[-1],
+            'total_tokens': len(x_tokens_final[0]),
+            'completion_tokens': len(x_tokens_final[0]) - input_ids.shape[-1],
+            'prompt_tokens_details': None
         }
     }
     logging.info('[%s] resp: %s', chat_uuid, resp)
@@ -332,7 +346,7 @@ def chat_openai(request: CompletionsRequest):
 def stream_put_endpoint(request: StreamRequest):
     ''' stream_put_endpoint '''
     stream_put_api(request.chat_uuid, request.curr_x)
-    return {"status": "success", "message": "Data added to stream"}
+    return {'status': 'success', 'message': 'Data added to stream'}
 
 
 @app.post('/v1/stream_get')
@@ -340,6 +354,48 @@ def stream_get_endpoint(request: StreamRequest):
     ''' stream_get_endpoint '''
     curr_x = stream_get_api(request.chat_uuid)
     return curr_x
+
+
+@app.api_route('/v1/models', methods=['GET', 'POST', 'OPTIONS'])
+def get_models():
+    ''' get_models
+    '''
+    created = time.time()
+    resp = {
+        'object':
+        'list',
+        'data': [{
+            'id':
+            TASK_DLLM_SERVE_MODEL_NAME,
+            'object':
+            'model',
+            'created':
+            created,
+            'owned_by':
+            'dinfer',
+            'root':
+            os.environ.get('SPECIAL_MODEL_DIR'),
+            'parent':
+            None,
+            'max_model_len':
+            TASK_DLLM_MAX_LENGTH,
+            'permission': [{
+                'id': 'modelperm-xyz-dllm',
+                'object': 'model_permission',
+                'created': created,
+                'allow_create_engine': False,
+                'allow_sampling': True,
+                'allow_logprobs': True,
+                'allow_search_indices': False,
+                'allow_view': True,
+                'allow_fine_tuning': False,
+                'organization': '*',
+                'group': None,
+                'is_blocking': False
+            }]
+        }]
+    }
+    return resp
 
 
 def mission():
