@@ -268,9 +268,9 @@ def generate(dllm, device, req_q, res_q):
             assert data == 'stop'
             break
         else:
-            input_ids, gen_len, block_len = data
+            input_ids, gen_len, block_len, chat_uuid = data
         input_ids = input_ids.to(device)
-        out = dllm.generate(input_ids, gen_length=gen_len, block_length=block_len)
+        out = dllm.generate(input_ids, gen_length=gen_len, block_length=block_len, chat_uuid=chat_uuid)
         num_forwards = dllm.num_forwards
         if res_q is not None:
             res_q.put((out, num_forwards))
@@ -485,18 +485,18 @@ class ServerHandle:
         self.groups = []
         self.need_response = 0
 
-    def add_requests(self, reqs):
+    def add_requests(self, reqs, chat_uuid=None):
         prompts, gen_length, block_length = reqs
         self.need_response = 0
         # assert len(self.groups) == prompts.shape[0], 'We cannot only use DP to support batch size > 1.'
         if len(self.groups) == prompts.shape[0]:
             for i, prompt in enumerate(prompts):
-                self.groups[i].add_request((prompt.unsqueeze(0), gen_length, block_length))
+                self.groups[i].add_request((prompt.unsqueeze(0), gen_length, block_length, chat_uuid))
             self.need_response = len(prompts)
         else:
             partial_data = torch.chunk(prompts, len(self.groups), dim=0)
             for i in range(len(partial_data)):
-                self.groups[i].add_request((partial_data[i], gen_length, block_length))
+                self.groups[i].add_request((partial_data[i], gen_length, block_length, chat_uuid))
             self.need_response = len(partial_data)
 
 
@@ -580,7 +580,7 @@ class DiffusionLLMServing:
         self.num_forwards = 0
         self.timeout = timeout
 
-    def generate(self, prompts, gen_length=128, block_length=128):
+    def generate(self, prompts, gen_length=128, block_length=128, chat_uuid=None):
         ''' Generate tokens with diffusion iterations.
 
         Parameters:
@@ -598,7 +598,7 @@ class DiffusionLLMServing:
             The generation results of different lengths are padded with EOS.
         '''
         prompts = prompts.cpu()
-        handle.add_requests((prompts, gen_length, block_length))
+        handle.add_requests((prompts, gen_length, block_length), chat_uuid=chat_uuid)
         rets = handle.get_responses(timeout=self.timeout)
         max_len = max([tensor.shape[1] for (tensor, _) in rets])
         total_batch_size = sum([tensor.shape[0] for (tensor, _) in rets])

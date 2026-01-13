@@ -1,3 +1,6 @@
+import os
+import requests
+
 import torch
 import numpy as np
 import logging
@@ -1041,7 +1044,7 @@ class BlockDiffusionLLM(DiffusionLLM):
         return self.diff_iteration.cache_updates
 
     @ torch.no_grad()
-    def naive_batching_generate(self, prompt, gen_length=128, block_length=128):
+    def naive_batching_generate(self, prompt, gen_length=128, block_length=128, chat_uuid=None):
         ''' Generate tokens with diffusion iterations block by block.
         '''
         # recalculate gen length and init iteratory
@@ -1075,7 +1078,13 @@ class BlockDiffusionLLM(DiffusionLLM):
         
         # We need to reset iter_no at the beginning of generating a sequence.
         self.diff_iteration.iter_no = 0
+        ip_port_url = 'http://0.0.0.0:' + os.environ.get('TASK_SERVER_PORT', '40081')
+        logger.info(f'[{chat_uuid}] ip_port_url: {ip_port_url}')
         for block_id, (block_loc, block) in enumerate(it):
+            if chat_uuid:
+                x_list = x.get_generated_tokens().tolist()
+                stream_dict = {'chat_uuid': chat_uuid, 'curr_x': x_list}
+                requests.post(f'{ip_port_url}/v1/stream_put', json=stream_dict)
             self.decoder.block_init(block, block_id)
             if self.backend == 'vllm':
                 cross_block_attn_mask = bd_attn_mask[:,block_loc.start-block_length:block_loc.end, :block_loc.end]
@@ -1086,10 +1095,16 @@ class BlockDiffusionLLM(DiffusionLLM):
             if torch.all(decode_compl) and self.early_stop:
                 break
         logger.info(f'The number of diffusion iterations: {self.num_forwards}')
-        return x.get_generated_tokens()
+
+        x_generated_tokens = x.get_generated_tokens()
+        if chat_uuid:
+            stream_dict = {'chat_uuid': chat_uuid, 'curr_x': x_generated_tokens.tolist()}
+            requests.post(f'{ip_port_url}/v1/stream_put', json=stream_dict)
+
+        return x_generated_tokens
 
     @ torch.no_grad()
-    def dynamic_batching_generate(self, prompt, gen_length=128, block_length=128):
+    def dynamic_batching_generate(self, prompt, gen_length=128, block_length=128, chat_uuid=None):
         ''' Generate tokens with dynamic batching
         '''
         assert self.cache_factory is not None

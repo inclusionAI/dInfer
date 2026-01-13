@@ -5,12 +5,15 @@ This is a fastapi dinfer serving of llada
 # pylint: disable=import-error, no-name-in-module
 # pylint: disable=global-statement, global-variable-not-assigned
 # pylint: disable=too-few-public-methods
+# pylint: disable=broad-exception-caught
 
 import json
 import logging
 import os
+from queue import Queue
+import threading
 import time
-from typing import List, Dict
+from typing import Dict, List, Optional
 import uuid
 
 from fastapi import FastAPI
@@ -65,6 +68,12 @@ class CompletionsRequest(BaseModel):
     stream: bool = Field(title='stream')
 
 
+class StreamRequest(BaseModel):
+    '''Stream Request'''
+    chat_uuid: str = Field(title='chat_uuid')
+    curr_x: Optional[List] = Field(title='curr_x')
+
+
 app = FastAPI(
     title='xyz dllm serving',
     redoc_url=None,
@@ -86,6 +95,9 @@ TASK_DLLM_THRESHOLD = float(os.environ.get('TASK_DLLM_THRESHOLD', 0.9))
 
 TASK_DLLM_MASK_ID = int(os.environ.get('TASK_DLLM_MASK_ID', 156895))
 TASK_DLLM_EOS_ID = int(os.environ.get('TASK_DLLM_EOS_ID', 156892))
+
+TASK_STREAM_SLEEP_SECONDS = float(
+    os.environ.get('TASK_STREAM_SLEEP_SECONDS', 0.005))
 
 
 def get_dllm():
@@ -127,11 +139,122 @@ def get_dllm():
 
 
 tokenizer, MODEL_DLLM = None, None
+global_stream_dict = {}
+stream_lock = threading.Lock()
+
+
+def stream_put_api(chat_uuid: str, curr_x: Optional[List]):
+    ''' stream_put_api '''
+    with stream_lock:
+        if chat_uuid not in global_stream_dict:
+            global_stream_dict[chat_uuid] = Queue()
+
+        if curr_x is None:
+            global_stream_dict[chat_uuid].put([])
+        else:
+            global_stream_dict[chat_uuid].put(curr_x)
+
+
+def stream_get_api(chat_uuid: str) -> Optional[List]:
+    ''' stream_get_api '''
+    try:
+        with stream_lock:
+            if chat_uuid not in global_stream_dict:
+                return None
+
+            queue = global_stream_dict[chat_uuid]
+            result = queue.get(timeout=0)
+
+            if result == []:
+                del global_stream_dict[chat_uuid]
+
+            return result
+
+    except Exception:
+        return None
+
+
+def generate_in_background(chat_uuid: str, data: Dict):
+    ''' generate_in_background '''
+
+    def _generate():
+        try:
+            global tokenizer, MODEL_DLLM
+            input_ids = tokenizer.apply_chat_template(
+                data['messages'],
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors='pt',
+            )
+            batch_input_ids = torch.zeros(
+                (input_ids.shape[0], TASK_DLLM_MAX_LENGTH),
+                dtype=torch.long).fill_(TASK_DLLM_MASK_ID)
+            for s_k in range(input_ids.shape[0]):
+                batch_input_ids[s_k, :input_ids.shape[-1]] = input_ids[s_k]
+
+            _ = MODEL_DLLM.generate(batch_input_ids,
+                                    chat_uuid=chat_uuid,
+                                    gen_length=TASK_DLLM_GEN_LENGTH,
+                                    block_length=TASK_DLLM_BLOCK_LENGTH)
+            stream_put_api(chat_uuid, None)
+
+        except Exception as err:
+            logging.error("Generate error: %s", err)
+            stream_put_api(chat_uuid, None)
+
+    thread = threading.Thread(target=_generate, daemon=True)
+    thread.start()
 
 
 def get_answer_openai(chat_uuid: str, data: Dict) -> str:
-    ''' get answer openai '''
-    logging.info('[%s] resp: %s', chat_uuid, data)
+    '''get answer openai'''
+
+    generate_in_background(chat_uuid, data)
+    resp = {}
+
+    while True:
+        curr_x = stream_get_api(chat_uuid)
+
+        if curr_x is None:
+            time.sleep(TASK_STREAM_SLEEP_SECONDS)
+            continue
+
+        if curr_x == []:
+            break
+
+        x_str = tokenizer.decode(curr_x[0])
+        text = x_str.split('<role>ASSISTANT</role>')[-1]
+        text = text.replace('<|endoftext|>', '').replace('<|role_end|>', '')
+        text = text.replace('<|mask|>', '　').rstrip('　')
+        resp = {
+            'id':
+            chat_uuid,
+            'object':
+            'chat.completion.chunk',
+            'created':
+            time.time(),
+            'model':
+            'xyz-dllm',
+            'choices': [{
+                'index': 0,
+                'delta': {
+                    'role': 'assistant',
+                    'content': text,
+                    'resoning_content': None
+                },
+                'logprobs': None,
+                'finish_reason': None,
+            }],
+            'prompt_token_ids':
+            None
+        }
+        yield 'data: ' + json.dumps(resp, ensure_ascii=False) + '\n'
+
+    logging.info('[%s] resp: %s', chat_uuid, resp)
+
+    with stream_lock:
+        if chat_uuid in global_stream_dict:
+            del global_stream_dict[chat_uuid]
 
 
 def get_answer_openai_no_stream(chat_uuid: str, data: Dict) -> str:
@@ -193,8 +316,7 @@ def get_answer_openai_no_stream(chat_uuid: str, data: Dict) -> str:
 
 @app.post('/v1/chat/completions')
 def chat_openai(request: CompletionsRequest):
-    ''' chat
-    '''
+    ''' chat '''
     chat_uuid = f'chat-{str(uuid.uuid4())}'
     data = request.dict()
     logging.info('[%s] req: %s', chat_uuid, data)
@@ -206,9 +328,22 @@ def chat_openai(request: CompletionsRequest):
     )
 
 
+@app.post('/v1/stream_put')
+def stream_put_endpoint(request: StreamRequest):
+    ''' stream_put_endpoint '''
+    stream_put_api(request.chat_uuid, request.curr_x)
+    return {"status": "success", "message": "Data added to stream"}
+
+
+@app.post('/v1/stream_get')
+def stream_get_endpoint(request: StreamRequest):
+    ''' stream_get_endpoint '''
+    curr_x = stream_get_api(request.chat_uuid)
+    return curr_x
+
+
 def mission():
-    ''' api demo
-    '''
+    ''' mission '''
     global tokenizer, MODEL_DLLM
     tokenizer, MODEL_DLLM, _ = get_dllm()
     port = int(os.environ.get('TASK_SERVER_PORT', '40081'))
