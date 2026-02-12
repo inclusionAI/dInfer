@@ -1,0 +1,44 @@
+# dInfer Docker Compose example
+#
+# Prerequisites:
+#   - NVIDIA Container Toolkit installed
+#   - Docker Compose v2.x with GPU support
+#
+# Example usage:
+#
+#   - Run benchmark with sample prompt:
+#      docker compose run --rm dinfer python benchmarks/benchmark.py \
+#        --model_name /models/LLaDA-MoE-7B-A1B-Instruct --model_type llada_moe \
+#        --gpu 0,1,2,3 --use_tp
+#
+#   - Convert a MoE model to FusedMoE format:
+#      docker compose run --rm dinfer python -m tools.transfer \
+#        --input /models/LLaDA-MoE-7B-A1B-Instruct \
+#        --output /models/LLaDA-MoE-7B-A1B-Instruct-fused
+#
+#   - Interactive Python session:
+#      docker compose run --rm dinfer python
+
+services:
+  &name dinfer:
+    hostname: *name
+    container_name: *name
+    build:
+      context: https://github.com/sammcj/dInfer.git#master
+      dockerfile: Dockerfile
+    image: dinfer:latest
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./models:/models
+    environment:
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - TOKENIZERS_PARALLELISM=false
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
