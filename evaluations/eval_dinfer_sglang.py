@@ -97,9 +97,9 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
 
     if args.parallel_decoding == 'threshold':
         if args.use_credit:
-            decoder = CreditThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=mask_id, eos_id=eos_id)
+            decoder = CreditThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=mask_id, eos_id=eos_id, enable_remask=args.enable_remask)
         else:
-            decoder = ThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=mask_id, eos_id=eos_id)
+            decoder = ThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=mask_id, eos_id=eos_id, enable_remask=args.enable_remask)
 
     else:
         decoder = HierarchyDecoder(temperature=0, threshold=args.threshold, low_threshold=args.low_threshold, mask_id=mask_id, eos_id=eos_id)
@@ -272,6 +272,7 @@ class EvalConfig:
     batch_size: int = 1
     save_samples: bool = False
     speed_path: str = ''
+    enable_remask: bool = False
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -316,6 +317,7 @@ class DInferEvalHarness(LM):
         use_shift = False,
         model_type = 'llada2',
         save_samples = False,
+        enable_remask = False,
         **kwargs
     ):
 
@@ -354,6 +356,7 @@ class DInferEvalHarness(LM):
         self.use_shift = use_shift
         self.model_type = model_type
         self.save_samples = save_samples
+        self.enable_remask = enable_remask
 
         if self.model_type == 'llada2': 
             self.mask_id = 156895
@@ -575,7 +578,7 @@ class DInferEvalHarness(LM):
         procs = []
         answers = []
         gpus = [int(gpu) for gpu in self.gpus.split(';')]
-        args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size, "speed_path": self.speed_path}
+        args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size, "speed_path": self.speed_path, "enable_remask": self.enable_remask}
         args = EvalConfig(**args)
         args.tp_size = len(gpus)
         args.master_port = self.master_port

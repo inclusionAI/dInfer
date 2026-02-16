@@ -247,7 +247,9 @@ class BlockDiffusionIterator():
         current_block_end = min(current_block_start + self.block_length, self.x.total_length)
         assert current_block_end <= self.x.total_length
         self.iter += 1
-        return BlockLoc(current_block_start, current_block_end), self.x[current_block_start:current_block_end]
+        # Fix dimension bug: originally was self.x[current_block_start:current_block_end], 
+        # now correctly uses self.x[:, current_block_start:current_block_end] to handle batch dimension
+        return BlockLoc(current_block_start, current_block_end), self.x[:, current_block_start:current_block_end]
 
 
 class BlockIteratorFactory:
